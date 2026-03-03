@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   View,
   Text,
@@ -8,21 +8,16 @@ import {
   I18nManager,
   ActivityIndicator,
   Alert,
-  AppState,
 } from 'react-native';
-import TrackPlayer, {
-  Event,
-  State,
-  useTrackPlayerEvents,
-  usePlaybackState,
-  useProgress,
-  Capability,
-} from 'react-native-track-player';
+import { Audio } from 'expo-av';
 import * as DocumentPicker from 'expo-document-picker';
 
 I18nManager.forceRTL(true);
 
 interface PlaybackState {
+  isPlaying: boolean;
+  duration: number;
+  position: number;
   rate: number;
   pitch: number;
 }
@@ -190,24 +185,13 @@ const LoopIcon = ({ size, color, enabled }: IconProps & { enabled?: boolean }) =
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
-// Setup track player
-const setupPlayer = async () => {
-  try {
-    await TrackPlayer.setupPlayer();
-    await TrackPlayer.updateOptions({
-      capabilities: [
-        Capability.Play,
-        Capability.Pause,
-        Capability.SeekTo,
-      ],
-    });
-  } catch (error) {
-    console.log('Player setup failed, might already be setup');
-  }
-};
-
 export default function AudioPlayerScreen() {
+  const soundRef = useRef<Audio.Sound | null>(null);
+  const [sound, setSound] = useState<Audio.Sound | null>(null);
   const [playbackState, setPlaybackState] = useState<PlaybackState>({
+    isPlaying: false,
+    duration: 0,
+    position: 0,
     rate: 1.0,
     pitch: 1.0,
   });
@@ -220,13 +204,9 @@ export default function AudioPlayerScreen() {
   const [isLoading, setIsLoading] = useState(false);
   const [waveformData, setWaveformData] = useState<number[]>([]);
   const [isVideo, setIsVideo] = useState(false);
-  const [isReady, setIsReady] = useState(false);
-
-  const playerState = usePlaybackState();
-  const { position, duration } = useProgress();
 
   // Generate simulated waveform data
-  const generateWaveformData = (dur: number) => {
+  const generateWaveformData = (duration: number) => {
     const data: number[] = [];
     const numBars = 100;
     for (let i = 0; i < numBars; i++) {
@@ -245,37 +225,48 @@ export default function AudioPlayerScreen() {
     return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
   };
 
-  // Initialize player
-  useEffect(() => {
-    setupPlayer().then(() => setIsReady(true));
+  // Update playback position
+  const updatePlaybackStatus = async () => {
+    if (sound) {
+      const status = await sound.getStatusAsync();
+      if (status.isLoaded) {
+        setPlaybackState(prev => ({
+          ...prev,
+          position: status.positionMillis || 0,
+          isPlaying: status.isPlaying,
+        }));
 
-    return () => {
-      TrackPlayer.destroy();
-    };
-  }, []);
-
-  // Handle app state changes
-  useEffect(() => {
-    const subscription = AppState.addEventListener('change', (state) => {
-      if (state === 'active') {
-        TrackPlayer.play();
-      }
-    });
-
-    return () => subscription.remove();
-  }, []);
-
-  // Loop checking
-  useTrackPlayerEvents([Event.PlaybackProgress], async (event) => {
-    if (loopState.enabled && loopState.startPoint !== null && loopState.endPoint !== null) {
-      if (event.position >= loopState.endPoint) {
-        await TrackPlayer.seekTo(loopState.startPoint);
-        if (playerState === State.Playing) {
-          await TrackPlayer.play();
+        // Check loop boundaries
+        if (loopState.enabled && loopState.startPoint !== null && loopState.endPoint !== null) {
+          const pos = status.positionMillis || 0;
+          if (pos >= loopState.endPoint) {
+            await sound.setPositionAsync(loopState.startPoint);
+            await sound.playAsync();
+          }
         }
       }
     }
-  });
+  };
+
+  // Effect to update playback status
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (sound && playbackState.isPlaying) {
+      interval = setInterval(updatePlaybackStatus, 100);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [sound, playbackState.isPlaying, loopState]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (sound) {
+        sound.unloadAsync();
+      }
+    };
+  }, [sound]);
 
   // Load and play audio
   const loadSound = async (uri: string, isVideoFile: boolean = false) => {
@@ -292,10 +283,22 @@ export default function AudioPlayerScreen() {
         );
       }
 
-      await TrackPlayer.reset();
-      await TrackPlayer.add({
-        url: uri,
-      });
+      const { sound: newSound, status } = await Audio.Sound.createAsync(
+        { uri },
+        {
+          shouldPlay: false,
+          rate: playbackState.rate,
+        }
+      );
+
+      soundRef.current = newSound;
+      setSound(newSound);
+      setPlaybackState(prev => ({
+        ...prev,
+        duration: status.durationMillis || 0,
+        position: 0,
+        isPlaying: false,
+      }));
 
       // Reset loop state
       setLoopState({
@@ -305,11 +308,18 @@ export default function AudioPlayerScreen() {
       });
 
       // Generate waveform data
-      setWaveformData(generateWaveformData(duration || 30000));
+      setWaveformData(generateWaveformData(status.durationMillis || 30000));
 
-      // Apply current settings
-      await TrackPlayer.setRate(playbackState.rate);
-      await TrackPlayer.setPitch(playbackState.pitch);
+      newSound.setOnPlaybackStatusUpdate((status) => {
+        if (status.isLoaded) {
+          setPlaybackState(prev => ({
+            ...prev,
+            position: status.positionMillis || 0,
+            isPlaying: status.isPlaying,
+            duration: status.durationMillis || 0,
+          }));
+        }
+      });
 
     } catch (error) {
       console.error('Error loading sound:', error);
@@ -347,18 +357,40 @@ export default function AudioPlayerScreen() {
 
   // Play/Pause toggle
   const togglePlayPause = async () => {
-    if (playerState === State.Playing) {
-      await TrackPlayer.pause();
-    } else {
-      await TrackPlayer.play();
+    if (!sound) return;
+
+    try {
+      const status = await sound.getStatusAsync();
+      if (status.isLoaded) {
+        if (status.isPlaying) {
+          await sound.pauseAsync();
+          setPlaybackState(prev => ({ ...prev, isPlaying: false }));
+        } else {
+          await sound.playAsync();
+          setPlaybackState(prev => ({ ...prev, isPlaying: true }));
+        }
+      }
+    } catch (error) {
+      console.error('Error toggling play/pause:', error);
     }
   };
 
   // Skip forward/backward
   const skip = async (milliseconds: number) => {
+    if (!sound || !playbackState.duration) return;
+
     try {
-      const newPosition = Math.max(0, position + milliseconds / 1000);
-      await TrackPlayer.seekTo(newPosition);
+      const status = await sound.getStatusAsync();
+      if (status.isLoaded) {
+        const newPosition = Math.max(
+          0,
+          Math.min(
+            playbackState.duration,
+            (status.positionMillis || 0) + milliseconds
+          )
+        );
+        await sound.setPositionAsync(newPosition);
+      }
     } catch (error) {
       console.error('Error skipping:', error);
     }
@@ -366,19 +398,31 @@ export default function AudioPlayerScreen() {
 
   // Change playback rate
   const changeRate = async (rate: number) => {
+    if (!sound) return;
+
     try {
-      await TrackPlayer.setRate(rate);
+      await sound.setRateAsync(rate);
       setPlaybackState(prev => ({ ...prev, rate }));
     } catch (error) {
       console.error('Error changing rate:', error);
     }
   };
 
-  // Change pitch (independent of speed with react-native-track-player)
+  // Change pitch (expo-av limitation: pitch changes with speed)
   const changePitch = async (pitch: number) => {
+    if (!sound) return;
+
     try {
-      await TrackPlayer.setPitch(pitch);
-      setPlaybackState(prev => ({ ...prev, pitch }));
+      // Note: In expo-av, pitch and speed change together
+      // To achieve independent pitch, we would need a different library
+      // For now, this changes both pitch and speed
+      await sound.setRateAsync(pitch);
+      setPlaybackState(prev => ({ ...prev, pitch, rate: pitch }));
+      Alert.alert(
+        'ملاحظة',
+        'في expo-av، تغيير النغمة يغير أيضاً السرعة. للتحكم المستقل، نحتاج مكتبة أخرى.',
+        [{ text: 'حسناً' }]
+      );
     } catch (error) {
       console.error('Error changing pitch:', error);
     }
@@ -386,31 +430,40 @@ export default function AudioPlayerScreen() {
 
   // Set loop A point
   const setLoopStart = async () => {
-    setLoopState(prev => ({
-      ...prev,
-      startPoint: position,
-    }));
+    if (!sound) return;
+
+    const status = await sound.getStatusAsync();
+    if (status.isLoaded) {
+      setLoopState(prev => ({
+        ...prev,
+        startPoint: status.positionMillis || 0,
+      }));
+    }
   };
 
   // Set loop B point
   const setLoopEnd = async () => {
-    if (loopState.startPoint === null) {
+    if (!sound || loopState.startPoint === null) {
       Alert.alert('تنبيه', 'يجب تحديد نقطة البداية أولاً');
       return;
     }
 
-    const endPoint = position;
-    if (endPoint <= loopState.startPoint) {
-      Alert.alert('تنبيه', 'يجب أن تكون نقطة النهاية بعد نقطة البداية');
-      return;
+    const status = await sound.getStatusAsync();
+    if (status.isLoaded) {
+      const endPoint = status.positionMillis || 0;
+      if (endPoint <= loopState.startPoint) {
+        Alert.alert('تنبيه', 'يجب أن تكون نقطة النهاية بعد نقطة البداية');
+        return;
+      }
+      setLoopState(prev => ({
+        ...prev,
+        endPoint,
+        enabled: true,
+      }));
+      await sound.setPositionAsync(loopState.startPoint);
+      await sound.playAsync();
+      setPlaybackState(prev => ({ ...prev, isPlaying: true }));
     }
-    setLoopState(prev => ({
-      ...prev,
-      endPoint,
-      enabled: true,
-    }));
-    await TrackPlayer.seekTo(loopState.startPoint);
-    await TrackPlayer.play();
   };
 
   // Clear loop
@@ -424,32 +477,19 @@ export default function AudioPlayerScreen() {
 
   // Seek to position (from waveform tap)
   const seekToPosition = async (percentage: number) => {
-    if (duration === 0) return;
+    if (!sound || !playbackState.duration) return;
 
-    const newPosition = (percentage / 100) * duration;
-    await TrackPlayer.seekTo(newPosition);
+    const newPosition = (percentage / 100) * playbackState.duration;
+    await sound.setPositionAsync(newPosition);
   };
 
   // Check if current position is in loop
-  const isInLoop = (pos: number) => {
+  const isInLoop = (position: number) => {
     if (!loopState.enabled || loopState.startPoint === null || loopState.endPoint === null) {
       return false;
     }
-    return pos >= loopState.startPoint && pos <= loopState.endPoint;
+    return position >= loopState.startPoint && position <= loopState.endPoint;
   };
-
-  const isPlaying = playerState === State.Playing;
-
-  if (!isReady) {
-    return (
-      <View style={styles.container}>
-        <View style={styles.initialState}>
-          <ActivityIndicator size="large" color="#4CAF50" />
-          <Text style={styles.initialText}>جاري التحميل...</Text>
-        </View>
-      </View>
-    );
-  }
 
   return (
     <View style={styles.container}>
@@ -481,17 +521,17 @@ export default function AudioPlayerScreen() {
       </TouchableOpacity>
 
       {/* Waveform Visualization */}
-      {fileName && (
+      {sound && (
         <View style={styles.waveformContainer}>
           <View style={styles.waveform}>
             {waveformData.map((amplitude, index) => {
-              const positionInSec = (index / waveformData.length) * duration;
-              const isPlayed = positionInSec <= position;
-              const inLoopRange = isInLoop(positionInSec);
+              const positionInMs = (index / waveformData.length) * playbackState.duration;
+              const isPlayed = positionInMs <= playbackState.position;
+              const inLoopRange = isInLoop(positionInMs);
               const isStartPoint = loopState.startPoint !== null &&
-                Math.abs(positionInSec - loopState.startPoint) < duration / waveformData.length;
+                Math.abs(positionInMs - loopState.startPoint) < playbackState.duration / waveformData.length;
               const isEndPoint = loopState.endPoint !== null &&
-                Math.abs(positionInSec - loopState.endPoint) < duration / waveformData.length;
+                Math.abs(positionInMs - loopState.endPoint) < playbackState.duration / waveformData.length;
 
               return (
                 <TouchableOpacity
@@ -518,16 +558,16 @@ export default function AudioPlayerScreen() {
       )}
 
       {/* Time Display */}
-      {fileName && (
+      {sound && (
         <View style={styles.timeDisplay}>
           <Text style={styles.timeText}>
-            {formatTime(position * 1000)} / {formatTime(duration * 1000)}
+            {formatTime(playbackState.position)} / {formatTime(playbackState.duration)}
           </Text>
         </View>
       )}
 
       {/* Playback Controls */}
-      {fileName && (
+      {sound && (
         <View style={styles.controlsContainer}>
           {/* A-B Loop Controls */}
           <View style={styles.loopControls}>
@@ -573,7 +613,7 @@ export default function AudioPlayerScreen() {
           <View style={styles.mainControls}>
             <TouchableOpacity
               style={styles.controlButton}
-              onPress={() => skip(-10)}
+              onPress={() => skip(-10000)}
             >
               <RewindIcon size={32} color="#333" />
               <Text style={styles.controlLabel}>10ث</Text>
@@ -583,7 +623,7 @@ export default function AudioPlayerScreen() {
               style={styles.playButton}
               onPress={togglePlayPause}
             >
-              {isPlaying ? (
+              {playbackState.isPlaying ? (
                 <PauseIcon size={40} color="#fff" />
               ) : (
                 <PlayIcon size={40} color="#fff" />
@@ -592,7 +632,7 @@ export default function AudioPlayerScreen() {
 
             <TouchableOpacity
               style={styles.controlButton}
-              onPress={() => skip(10)}
+              onPress={() => skip(10000)}
             >
               <ForwardIcon size={32} color="#333" />
               <Text style={styles.controlLabel}>10ث</Text>
@@ -650,14 +690,14 @@ export default function AudioPlayerScreen() {
               ))}
             </View>
             <Text style={styles.pitchInfoText}>
-              🎵 النغمة تعمل بشكل مستقل عن السرعة
+              ⚠️ في expo-av، النغمة والسرعة تتغيران معاً
             </Text>
           </View>
         </View>
       )}
 
       {/* Initial State */}
-      {!fileName && !isLoading && (
+      {!sound && !isLoading && (
         <View style={styles.initialState}>
           <UploadIcon size={64} color="#888" />
           <Text style={styles.initialText}>
@@ -880,7 +920,7 @@ const styles = StyleSheet.create({
   },
   pitchInfoText: {
     fontSize: 11,
-    color: '#666',
+    color: '#E65100',
     textAlign: 'center',
     marginTop: 8,
     fontStyle: 'italic',
