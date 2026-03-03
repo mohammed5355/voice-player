@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -8,17 +8,26 @@ import {
   I18nManager,
   ActivityIndicator,
   Alert,
+  AppState,
+  PermissionsAndroid,
+  Platform,
 } from 'react-native';
-import { Audio } from 'expo-av';
+import TrackPlayer, {
+  Event,
+  State,
+  useTrackPlayerEvents,
+  usePlaybackState,
+  useProgress,
+  Capability,
+} from 'react-native-track-player';
 import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system';
 
 I18nManager.forceRTL(true);
 
 interface PlaybackState {
-  isPlaying: boolean;
-  duration: number;
-  position: number;
   rate: number;
+  pitch: number;
 }
 
 interface LoopState {
@@ -184,14 +193,26 @@ const LoopIcon = ({ size, color, enabled }: IconProps & { enabled?: boolean }) =
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
+// Setup track player
+const setupPlayer = async () => {
+  try {
+    await TrackPlayer.setupPlayer();
+    await TrackPlayer.updateOptions({
+      capabilities: [
+        Capability.Play,
+        Capability.Pause,
+        Capability.SeekTo,
+      ],
+    });
+  } catch (error) {
+    console.log('Player setup failed, might already be setup');
+  }
+};
+
 export default function AudioPlayerScreen() {
-  const soundRef = useRef<Audio.Sound | null>(null);
-  const [sound, setSound] = useState<Audio.Sound | null>(null);
   const [playbackState, setPlaybackState] = useState<PlaybackState>({
-    isPlaying: false,
-    duration: 0,
-    position: 0,
     rate: 1.0,
+    pitch: 1.0,
   });
   const [loopState, setLoopState] = useState<LoopState>({
     enabled: false,
@@ -202,9 +223,13 @@ export default function AudioPlayerScreen() {
   const [isLoading, setIsLoading] = useState(false);
   const [waveformData, setWaveformData] = useState<number[]>([]);
   const [isVideo, setIsVideo] = useState(false);
+  const [isReady, setIsReady] = useState(false);
+
+  const playerState = usePlaybackState();
+  const { position, duration } = useProgress();
 
   // Generate simulated waveform data
-  const generateWaveformData = (duration: number) => {
+  const generateWaveformData = (dur: number) => {
     const data: number[] = [];
     const numBars = 100;
     for (let i = 0; i < numBars; i++) {
@@ -223,48 +248,53 @@ export default function AudioPlayerScreen() {
     return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
   };
 
-  // Update playback position
-  const updatePlaybackStatus = async () => {
-    if (sound) {
-      const status = await sound.getStatusAsync();
-      if (status.isLoaded) {
-        setPlaybackState(prev => ({
-          ...prev,
-          position: status.positionMillis || 0,
-          isPlaying: status.isPlaying,
-        }));
+  // Request storage permission for Android
+  const requestStoragePermission = async () => {
+    if (Platform.OS === 'android' && Platform.Version >= 33) {
+      try {
+        const granted = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO
+        );
+        return granted === PermissionsAndroid.RESULTS.GRANTED;
+      } catch (err) {
+        console.warn(err);
+        return false;
+      }
+    }
+    return true;
+  };
 
-        // Check loop boundaries
-        if (loopState.enabled && loopState.startPoint !== null && loopState.endPoint !== null) {
-          const pos = status.positionMillis || 0;
-          if (pos >= loopState.endPoint) {
-            await sound.setPositionAsync(loopState.startPoint);
-            await sound.playAsync();
-          }
+  // Initialize player
+  useEffect(() => {
+    setupPlayer().then(() => setIsReady(true));
+
+    return () => {
+      TrackPlayer.destroy();
+    };
+  }, []);
+
+  // Handle app state changes
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active' && playerState === State.Ready) {
+        TrackPlayer.play();
+      }
+    });
+
+    return () => subscription.remove();
+  }, [playerState]);
+
+  // Loop checking
+  useTrackPlayerEvents([Event.PlaybackProgress], async (event) => {
+    if (loopState.enabled && loopState.startPoint !== null && loopState.endPoint !== null) {
+      if (event.position >= loopState.endPoint) {
+        await TrackPlayer.seekTo(loopState.startPoint);
+        if (playerState === State.Playing) {
+          await TrackPlayer.play();
         }
       }
     }
-  };
-
-  // Effect to update playback status
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (sound && playbackState.isPlaying) {
-      interval = setInterval(updatePlaybackStatus, 100);
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [sound, playbackState.isPlaying, loopState]);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (sound) {
-        sound.unloadAsync();
-      }
-    };
-  }, [sound]);
+  });
 
   // Load and play audio
   const loadSound = async (uri: string, isVideoFile: boolean = false) => {
@@ -281,22 +311,10 @@ export default function AudioPlayerScreen() {
         );
       }
 
-      const { sound: newSound, status } = await Audio.Sound.createAsync(
-        { uri },
-        {
-          shouldPlay: false,
-          rate: playbackState.rate,
-        }
-      );
-
-      soundRef.current = newSound;
-      setSound(newSound);
-      setPlaybackState(prev => ({
-        ...prev,
-        duration: status.durationMillis || 0,
-        position: 0,
-        isPlaying: false,
-      }));
+      await TrackPlayer.reset();
+      await TrackPlayer.add({
+        url: uri,
+      });
 
       // Reset loop state
       setLoopState({
@@ -306,18 +324,11 @@ export default function AudioPlayerScreen() {
       });
 
       // Generate waveform data
-      setWaveformData(generateWaveformData(status.durationMillis || 30000));
+      setWaveformData(generateWaveformData(duration || 30000));
 
-      newSound.setOnPlaybackStatusUpdate((status) => {
-        if (status.isLoaded) {
-          setPlaybackState(prev => ({
-            ...prev,
-            position: status.positionMillis || 0,
-            isPlaying: status.isPlaying,
-            duration: status.durationMillis || 0,
-          }));
-        }
-      });
+      // Apply current settings
+      await TrackPlayer.setRate(playbackState.rate);
+      await TrackPlayer.setPitch(playbackState.pitch);
 
     } catch (error) {
       console.error('Error loading sound:', error);
@@ -330,6 +341,12 @@ export default function AudioPlayerScreen() {
   // Handle file upload
   const handleFileUpload = async () => {
     try {
+      const hasPermission = await requestStoragePermission();
+      if (!hasPermission) {
+        Alert.alert('تنبيه', 'يحتاج إذن الوصول للملفات الصوتية');
+        return;
+      }
+
       const result = await DocumentPicker.getDocumentAsync({
         type: [
           'audio/*',
@@ -355,93 +372,70 @@ export default function AudioPlayerScreen() {
 
   // Play/Pause toggle
   const togglePlayPause = async () => {
-    if (!sound) return;
-
-    try {
-      const status = await sound.getStatusAsync();
-      if (status.isLoaded) {
-        if (status.isPlaying) {
-          await sound.pauseAsync();
-          setPlaybackState(prev => ({ ...prev, isPlaying: false }));
-        } else {
-          await sound.playAsync();
-          setPlaybackState(prev => ({ ...prev, isPlaying: true }));
-        }
-      }
-    } catch (error) {
-      console.error('Error toggling play/pause:', error);
+    if (playerState === State.Playing) {
+      await TrackPlayer.pause();
+    } else {
+      await TrackPlayer.play();
     }
   };
 
   // Skip forward/backward
   const skip = async (milliseconds: number) => {
-    if (!sound || !playbackState.duration) return;
-
     try {
-      const status = await sound.getStatusAsync();
-      if (status.isLoaded) {
-        const newPosition = Math.max(
-          0,
-          Math.min(
-            playbackState.duration,
-            (status.positionMillis || 0) + milliseconds
-          )
-        );
-        await sound.setPositionAsync(newPosition);
-      }
+      const newPosition = Math.max(0, position + milliseconds / 1000);
+      await TrackPlayer.seekTo(newPosition);
     } catch (error) {
       console.error('Error skipping:', error);
     }
   };
 
-  // Change playback rate
+  // Change playback rate (speed only)
   const changeRate = async (rate: number) => {
-    if (!sound) return;
-
     try {
-      await sound.setRateAsync(rate);
+      await TrackPlayer.setRate(rate);
       setPlaybackState(prev => ({ ...prev, rate }));
     } catch (error) {
       console.error('Error changing rate:', error);
     }
   };
 
+  // Change pitch (independent of speed with react-native-track-player)
+  const changePitch = async (pitch: number) => {
+    try {
+      await TrackPlayer.setPitch(pitch);
+      setPlaybackState(prev => ({ ...prev, pitch }));
+    } catch (error) {
+      console.error('Error changing pitch:', error);
+    }
+  };
+
   // Set loop A point
   const setLoopStart = async () => {
-    if (!sound) return;
-
-    const status = await sound.getStatusAsync();
-    if (status.isLoaded) {
-      setLoopState(prev => ({
-        ...prev,
-        startPoint: status.positionMillis || 0,
-      }));
-    }
+    setLoopState(prev => ({
+      ...prev,
+      startPoint: position,
+    }));
   };
 
   // Set loop B point
   const setLoopEnd = async () => {
-    if (!sound || loopState.startPoint === null) {
+    if (loopState.startPoint === null) {
       Alert.alert('تنبيه', 'يجب تحديد نقطة البداية أولاً');
       return;
     }
 
-    const status = await sound.getStatusAsync();
-    if (status.isLoaded) {
-      const endPoint = status.positionMillis || 0;
-      if (endPoint <= loopState.startPoint) {
-        Alert.alert('تنبيه', 'يجب أن تكون نقطة النهاية بعد نقطة البداية');
-        return;
-      }
-      setLoopState(prev => ({
-        ...prev,
-        endPoint,
-        enabled: true,
-      }));
-      await sound.setPositionAsync(loopState.startPoint);
-      await sound.playAsync();
-      setPlaybackState(prev => ({ ...prev, isPlaying: true }));
+    const endPoint = position;
+    if (endPoint <= loopState.startPoint) {
+      Alert.alert('تنبيه', 'يجب أن تكون نقطة النهاية بعد نقطة البداية');
+      return;
     }
+    setLoopState(prev => ({
+      ...prev,
+      endPoint,
+      enabled: true,
+    }));
+    await TrackPlayer.seekTo(loopState.startPoint);
+    await TrackPlayer.play();
   };
 
   // Clear loop
@@ -455,19 +449,32 @@ export default function AudioPlayerScreen() {
 
   // Seek to position (from waveform tap)
   const seekToPosition = async (percentage: number) => {
-    if (!sound || !playbackState.duration) return;
+    if (duration === 0) return;
 
-    const newPosition = (percentage / 100) * playbackState.duration;
-    await sound.setPositionAsync(newPosition);
+    const newPosition = (percentage / 100) * duration;
+    await TrackPlayer.seekTo(newPosition);
   };
 
   // Check if current position is in loop
-  const isInLoop = (position: number) => {
+  const isInLoop = (pos: number) => {
     if (!loopState.enabled || loopState.startPoint === null || loopState.endPoint === null) {
       return false;
     }
-    return position >= loopState.startPoint && position <= loopState.endPoint;
+    return pos >= loopState.startPoint && pos <= loopState.endPoint;
   };
+
+  const isPlaying = playerState === State.Playing;
+
+  if (!isReady) {
+    return (
+      <View style={styles.container}>
+        <View style={styles.initialState}>
+          <ActivityIndicator size="large" color="#4CAF50" />
+          <Text style={styles.initialText}>جاري التحميل...</Text>
+        </View>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.container}>
@@ -499,17 +506,17 @@ export default function AudioPlayerScreen() {
       </TouchableOpacity>
 
       {/* Waveform Visualization */}
-      {sound && (
+      {fileName && (
         <View style={styles.waveformContainer}>
           <View style={styles.waveform}>
             {waveformData.map((amplitude, index) => {
-              const positionInMs = (index / waveformData.length) * playbackState.duration;
-              const isPlayed = positionInMs <= playbackState.position;
-              const inLoopRange = isInLoop(positionInMs);
+              const positionInSec = (index / waveformData.length) * duration;
+              const isPlayed = positionInSec <= position;
+              const inLoopRange = isInLoop(positionInSec);
               const isStartPoint = loopState.startPoint !== null &&
-                Math.abs(positionInMs - loopState.startPoint) < playbackState.duration / waveformData.length;
+                Math.abs(positionInSec - loopState.startPoint) < duration / waveformData.length;
               const isEndPoint = loopState.endPoint !== null &&
-                Math.abs(positionInMs - loopState.endPoint) < playbackState.duration / waveformData.length;
+                Math.abs(positionInSec - loopState.endPoint) < duration / waveformData.length;
 
               return (
                 <TouchableOpacity
@@ -536,16 +543,16 @@ export default function AudioPlayerScreen() {
       )}
 
       {/* Time Display */}
-      {sound && (
+      {fileName && (
         <View style={styles.timeDisplay}>
           <Text style={styles.timeText}>
-            {formatTime(playbackState.position)} / {formatTime(playbackState.duration)}
+            {formatTime(position * 1000)} / {formatTime(duration * 1000)}
           </Text>
         </View>
       )}
 
       {/* Playback Controls */}
-      {sound && (
+      {fileName && (
         <View style={styles.controlsContainer}>
           {/* A-B Loop Controls */}
           <View style={styles.loopControls}>
@@ -591,7 +598,7 @@ export default function AudioPlayerScreen() {
           <View style={styles.mainControls}>
             <TouchableOpacity
               style={styles.controlButton}
-              onPress={() => skip(-10000)}
+              onPress={() => skip(-10)}
             >
               <RewindIcon size={32} color="#333" />
               <Text style={styles.controlLabel}>10ث</Text>
@@ -601,7 +608,7 @@ export default function AudioPlayerScreen() {
               style={styles.playButton}
               onPress={togglePlayPause}
             >
-              {playbackState.isPlaying ? (
+              {isPlaying ? (
                 <PauseIcon size={40} color="#fff" />
               ) : (
                 <PlayIcon size={40} color="#fff" />
@@ -610,7 +617,7 @@ export default function AudioPlayerScreen() {
 
             <TouchableOpacity
               style={styles.controlButton}
-              onPress={() => skip(10000)}
+              onPress={() => skip(10)}
             >
               <ForwardIcon size={32} color="#333" />
               <Text style={styles.controlLabel}>10ث</Text>
@@ -642,11 +649,40 @@ export default function AudioPlayerScreen() {
               ))}
             </View>
           </View>
+
+          {/* Pitch Control */}
+          <View style={styles.pitchContainer}>
+            <Text style={styles.sliderLabel}>النغمة: {playbackState.pitch.toFixed(1)}×</Text>
+            <View style={styles.pitchSlider}>
+              {[0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0].map((pitch) => (
+                <TouchableOpacity
+                  key={pitch}
+                  style={[
+                    styles.pitchButton,
+                    playbackState.pitch === pitch && styles.pitchButtonActive,
+                  ]}
+                  onPress={() => changePitch(pitch)}
+                >
+                  <Text
+                    style={[
+                      styles.pitchButtonText,
+                      playbackState.pitch === pitch && styles.pitchButtonTextActive,
+                    ]}
+                  >
+                    {pitch}×
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <Text style={styles.pitchInfoText}>
+              ✓ النغمة تعمل بشكل مستقل عن السرعة
+            </Text>
+          </View>
         </View>
       )}
 
       {/* Initial State */}
-      {!sound && !isLoading && (
+      {!fileName && !isLoading && (
         <View style={styles.initialState}>
           <UploadIcon size={64} color="#888" />
           <Text style={styles.initialText}>
@@ -840,6 +876,39 @@ const styles = StyleSheet.create({
   },
   speedButtonTextActive: {
     color: '#fff',
+  },
+  pitchContainer: {
+    marginBottom: 16,
+  },
+  pitchSlider: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  pitchButton: {
+    flex: 1,
+    paddingVertical: 10,
+    marginHorizontal: 2,
+    borderRadius: 8,
+    backgroundColor: '#f0f0f0',
+    alignItems: 'center',
+  },
+  pitchButtonActive: {
+    backgroundColor: '#2196F3',
+  },
+  pitchButtonText: {
+    fontSize: 12,
+    color: '#666',
+    fontWeight: '500',
+  },
+  pitchButtonTextActive: {
+    color: '#fff',
+  },
+  pitchInfoText: {
+    fontSize: 11,
+    color: '#4CAF50',
+    textAlign: 'center',
+    marginTop: 8,
+    fontStyle: 'italic',
   },
   initialState: {
     flex: 1,
