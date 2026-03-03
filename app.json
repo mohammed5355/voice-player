@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "Voice Player",
+    "slug": "voice-player",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.voiceplayer.app"
+    },
+    "android": {
+      "package": "com.voiceplayer.app"
+    },
+    "plugins": [
+      "expo-router"
+    ]
+  }
+}
