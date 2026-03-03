@@ -20,6 +20,7 @@ interface PlaybackState {
   duration: number;
   position: number;
   rate: number;
+  pitch: number;
 }
 
 interface LoopState {
@@ -193,6 +194,7 @@ export default function AudioPlayerScreen() {
     duration: 0,
     position: 0,
     rate: 1.0,
+    pitch: 1.0,
   });
   const [loopState, setLoopState] = useState<LoopState>({
     enabled: false,
@@ -408,6 +410,21 @@ export default function AudioPlayerScreen() {
       setPlaybackState(prev => ({ ...prev, rate }));
     } catch (error) {
       console.error('Error changing rate:', error);
+    }
+  };
+
+  // Change pitch (Note: expo-av changes both speed and pitch together)
+  const changePitch = async (pitch: number) => {
+    if (!sound) return;
+
+    try {
+      // In expo-av, setRateAsync changes both speed and pitch together
+      // 0.5x = lower pitch and slower speed
+      // 2.0x = higher pitch and faster speed
+      await sound.setRateAsync(pitch);
+      setPlaybackState(prev => ({ ...prev, pitch, rate: pitch }));
+    } catch (error) {
+      console.error('Error changing pitch:', error);
     }
   };
 
@@ -648,10 +665,32 @@ export default function AudioPlayerScreen() {
             </View>
           </View>
 
-          {/* Pitch Control Note */}
-          <View style={styles.pitchNote}>
-            <Text style={styles.pitchNoteText}>
-              ⚠️ ملاحظة: تعديل النغمة (Pitch) يتطلب مكتبة صوتية متقدمة - يمكن إضافتها باستخدام React Native Audio Processing
+          {/* Pitch Control */}
+          <View style={styles.pitchContainer}>
+            <Text style={styles.sliderLabel}>النغمة: {playbackState.pitch.toFixed(1)}×</Text>
+            <View style={styles.pitchSlider}>
+              {[0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0].map((pitch) => (
+                <TouchableOpacity
+                  key={pitch}
+                  style={[
+                    styles.pitchButton,
+                    playbackState.pitch === pitch && styles.pitchButtonActive,
+                  ]}
+                  onPress={() => changePitch(pitch)}
+                >
+                  <Text
+                    style={[
+                      styles.pitchButtonText,
+                      playbackState.pitch === pitch && styles.pitchButtonTextActive,
+                    ]}
+                  >
+                    {pitch}×
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <Text style={styles.pitchInfoText}>
+              🎵 النغمة والسرعة تتغيران معاً
             </Text>
           </View>
         </View>
@@ -853,16 +892,38 @@ const styles = StyleSheet.create({
   speedButtonTextActive: {
     color: '#fff',
   },
-  pitchNote: {
-    backgroundColor: '#FFF3E0',
-    padding: 12,
-    borderRadius: 8,
-    marginTop: 8,
+  pitchContainer: {
+    marginBottom: 16,
   },
-  pitchNoteText: {
+  pitchSlider: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  pitchButton: {
+    flex: 1,
+    paddingVertical: 10,
+    marginHorizontal: 2,
+    borderRadius: 8,
+    backgroundColor: '#f0f0f0',
+    alignItems: 'center',
+  },
+  pitchButtonActive: {
+    backgroundColor: '#2196F3',
+  },
+  pitchButtonText: {
+    fontSize: 12,
+    color: '#666',
+    fontWeight: '500',
+  },
+  pitchButtonTextActive: {
+    color: '#fff',
+  },
+  pitchInfoText: {
     fontSize: 11,
-    color: '#E65100',
+    color: '#666',
     textAlign: 'center',
+    marginTop: 8,
+    fontStyle: 'italic',
   },
   initialState: {
     flex: 1,
