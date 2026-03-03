@@ -13,7 +13,21 @@
       "package": "com.voiceplayer.app"
     },
     "plugins": [
-      "expo-router"
+      "expo-router",
+      [
+        "react-native-track-player",
+        {
+          "android": {
+            "foregroundService": {
+              "channelId": "com.voiceplayer.app.channel",
+              "channelName": "Voice Player",
+              "notification": {
+                "color": "#4CAF50"
+              }
+            }
+          }
+        }
+      ]
     ]
   }
 }
